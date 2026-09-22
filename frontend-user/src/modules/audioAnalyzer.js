@@ -114,10 +114,15 @@ export class AudioAnalyzer {
     // 位反转排序
     const real = new Float32Array(n);
     const imag = new Float32Array(n);
-    
+    const levels = Math.round(Math.log2(n));
+
     for (let i = 0; i < n; i++) {
-      real[i] = data[i];
-      imag[i] = 0;
+      let reversed = 0;
+      for (let bit = 0; bit < levels; bit++) {
+        reversed = (reversed << 1) | ((i >>> bit) & 1);
+      }
+      real[reversed] = data[i];
+      imag[reversed] = 0;
     }
 
     // 迭代 FFT
@@ -181,28 +186,60 @@ export class AudioAnalyzer {
     const minPeriod = Math.floor(sampleRate / 2000); // 最高频率 2000Hz
     const maxPeriod = Math.floor(sampleRate / 50);   // 最低频率 50Hz
     const dataLength = Math.min(audioData.length, sampleRate); // 最多分析1秒
-    
+    const periodLimit = Math.min(maxPeriod, Math.floor(dataLength / 2));
+
+    // 计算所有候选周期的相关值
+    const correlations = new Float32Array(periodLimit + 1);
     let maxCorr = 0;
-    let bestPeriod = minPeriod;
-    
-    for (let period = minPeriod; period < maxPeriod && period < dataLength / 2; period++) {
+    let maxCorrPeriod = minPeriod;
+
+    for (let period = minPeriod; period < periodLimit; period++) {
       let corr = 0;
       let count = 0;
-      
+
       for (let i = 0; i < dataLength - period; i++) {
         corr += audioData[i] * audioData[i + period];
         count++;
       }
-      
+
       corr /= count;
-      
+      correlations[period] = corr;
+
       if (corr > maxCorr) {
         maxCorr = corr;
-        bestPeriod = period;
+        maxCorrPeriod = period;
       }
     }
-    
-    return sampleRate / bestPeriod;
+
+    // 周期信号的自相关在 T、2T、3T... 处都会出现峰值，
+    // 直接取全局最大值容易把 2T 误判为基频（低八度误检）。
+    // 改为从最短周期开始，取第一个接近全局最大值的局部峰值。
+    const threshold = maxCorr * 0.95;
+    let bestPeriod = maxCorrPeriod;
+
+    for (let period = minPeriod + 1; period < periodLimit - 1; period++) {
+      const corr = correlations[period];
+      if (corr >= threshold &&
+          corr >= correlations[period - 1] &&
+          corr >= correlations[period + 1]) {
+        bestPeriod = period;
+        break;
+      }
+    }
+
+    // 抛物线插值提高周期精度
+    let refinedPeriod = bestPeriod;
+    if (bestPeriod > minPeriod && bestPeriod < periodLimit - 1) {
+      const y1 = correlations[bestPeriod - 1];
+      const y2 = correlations[bestPeriod];
+      const y3 = correlations[bestPeriod + 1];
+      const denominator = y1 - 2 * y2 + y3;
+      if (denominator !== 0) {
+        refinedPeriod = bestPeriod + 0.5 * (y1 - y3) / denominator;
+      }
+    }
+
+    return sampleRate / refinedPeriod;
   }
 
   /**
@@ -226,33 +263,49 @@ export class AudioAnalyzer {
   }
 
   /**
-   * 验证基频 - 检查是否有更低的基频
+   * 验证基频 - 检查是否把倍频或次谐波误检为基频
    */
   verifyFundamental(freq, frequencies, magnitudes) {
-    // 检查 freq/2, freq/3 等是否也有显著能量
-    const possibleFundamentals = [freq, freq / 2, freq / 3];
-    
-    for (const possibleFreq of possibleFundamentals) {
-      if (possibleFreq < 50) continue;
-      
-      // 检查该频率附近是否有能量
-      const tolerance = possibleFreq * 0.05; // 5% 容差
-      let hasEnergy = false;
-      
+    if (magnitudes.length === 0) return freq;
+
+    const maxMagnitude = Math.max(...magnitudes);
+    if (maxMagnitude <= 0) return freq;
+
+    // 查找目标频率附近的最强能量
+    const energyNear = (targetFreq) => {
+      const tolerance = targetFreq * 0.05; // 5% 容差
+      let energy = 0;
+
       for (let i = 0; i < frequencies.length; i++) {
-        if (Math.abs(frequencies[i] - possibleFreq) < tolerance) {
-          if (magnitudes[i] > 0.1 * Math.max(...magnitudes)) {
-            hasEnergy = true;
-            break;
-          }
+        if (Math.abs(frequencies[i] - targetFreq) < tolerance) {
+          energy = Math.max(energy, magnitudes[i]);
         }
       }
-      
-      if (hasEnergy && possibleFreq < freq) {
+
+      return energy;
+    };
+
+    // 向下检查：freq/2、freq/3 处若有显著能量，
+    // 说明检测到的可能是倍频，真正的基频更低
+    const possibleFundamentals = [freq / 2, freq / 3];
+
+    for (const possibleFreq of possibleFundamentals) {
+      if (possibleFreq < 50) continue;
+
+      if (energyNear(possibleFreq) > 0.1 * maxMagnitude) {
         return possibleFreq;
       }
     }
-    
+
+    // 向上检查：若当前频率几乎没有能量，而其 2 倍频处能量显著，
+    // 说明检测到的是次谐波（低八度误检），真正的基频更高
+    if (energyNear(freq) < 0.05 * maxMagnitude) {
+      const doubledFreq = freq * 2;
+      if (doubledFreq <= 2000 && energyNear(doubledFreq) > 0.1 * maxMagnitude) {
+        return doubledFreq;
+      }
+    }
+
     return freq;
   }
 
