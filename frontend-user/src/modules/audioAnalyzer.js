@@ -81,9 +81,9 @@ export class AudioAnalyzer {
     const paddedData = new Float32Array(fftSize);
     const copyLength = Math.min(audioData.length, fftSize);
     
-    // 应用汉宁窗
+    // 应用汉宁窗（窗长始终以 FFT 大小为准，零填充部分保持为 0）
     for (let i = 0; i < copyLength; i++) {
-      const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (copyLength - 1)));
+      const window = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1)));
       paddedData[i] = audioData[i] * window;
     }
 
@@ -111,7 +111,7 @@ export class AudioAnalyzer {
       return { real: [data[0] || 0], imag: [0] };
     }
 
-    // 位反转排序
+    // 复制输入数据
     const real = new Float32Array(n);
     const imag = new Float32Array(n);
     
@@ -120,23 +120,38 @@ export class AudioAnalyzer {
       imag[i] = 0;
     }
 
+    // 位反转重排（DIT Cooley-Tukey 要求输入按位反转排列）
+    for (let i = 0, j = 0; i < n; i++) {
+      if (j > i) {
+        const tmp = real[i];
+        real[i] = real[j];
+        real[j] = tmp;
+      }
+      let bit = n >> 1;
+      while (j & bit) {
+        j ^= bit;
+        bit >>= 1;
+      }
+      j ^= bit;
+    }
+
     // 迭代 FFT
     for (let size = 2; size <= n; size *= 2) {
       const halfSize = size / 2;
-      const step = n / size;
-      
+
       for (let i = 0; i < n; i += size) {
         for (let j = 0; j < halfSize; j++) {
-          const angle = -2 * Math.PI * j * step / n;
+          // 旋转因子 W_size^j = exp(-2πi·j/size)
+          const angle = -2 * Math.PI * j / size;
           const cos = Math.cos(angle);
           const sin = Math.sin(angle);
-          
+
           const idx1 = i + j;
           const idx2 = i + j + halfSize;
-          
+
           const tReal = real[idx2] * cos - imag[idx2] * sin;
           const tImag = real[idx2] * sin + imag[idx2] * cos;
-          
+
           real[idx2] = real[idx1] - tReal;
           imag[idx2] = imag[idx1] - tImag;
           real[idx1] = real[idx1] + tReal;
@@ -149,59 +164,122 @@ export class AudioAnalyzer {
   }
 
   /**
-   * 检测基频 - 使用自相关法和峰值检测
+   * 检测基频 - 使用归一化自相关法，并用频谱能量做倍频/半频校验
+   *
+   * 古琴这类拨弦乐器的信号由整倍数谐波构成，朴素自相关在基频周期的
+   * 整数倍处都会出现相关峰，加上信号幅度随时间衰减带来的窗口偏差，
+   * 很容易把 2 倍周期（即低八度的半频）误选为基频。
+   * 这里改为：
+   *   1. 去均值 + 逐滞后归一化的自相关 (NACF)，消除窗口长度偏差；
+   *   2. 选择第一个超过阈值的局部峰（最短周期），而不是全局最大值；
+   *   3. 再用频谱能量校验：候选频率处几乎没有能量而 2 倍频能量显著时，
+   *      判定为半频误检并上移一个八度。
    */
   detectFundamentalFrequency(audioData, sampleRate, frequencies, magnitudes) {
-    // 方法1: 自相关法
+    // 方法1: 归一化自相关法
     const autocorrFreq = this.autocorrelation(audioData, sampleRate);
-    
+
     // 方法2: 峰值检测法
     const peakFreq = this.findDominantPeak(frequencies, magnitudes);
-    
-    // 综合判断 - 优先使用自相关法的结果，因为它对古琴这类乐器更准确
+
+    // 优先使用自相关法的结果，因为它对古琴这类谐波丰富的乐器更稳定
     let fundamentalFreq = autocorrFreq;
-    
+
     // 如果自相关法结果不合理，使用峰值检测
-    if (fundamentalFreq < 50 || fundamentalFreq > 2000) {
+    if (!fundamentalFreq || fundamentalFreq < 50 || fundamentalFreq > 2000) {
       fundamentalFreq = peakFreq;
     }
-    
-    // 验证：检查是否可能是倍频被误检为基频
-    const possibleFundamental = this.verifyFundamental(fundamentalFreq, frequencies, magnitudes);
-    
-    logger.info('基频检测结果', { autocorrFreq, peakFreq, final: possibleFundamental });
-    
-    return possibleFundamental;
+
+    // 频谱校验：修正半频（低八度）误检
+    fundamentalFreq = this.correctOctaveError(fundamentalFreq, frequencies, magnitudes);
+
+    logger.info('基频检测结果', { autocorrFreq, peakFreq, final: fundamentalFreq });
+
+    return fundamentalFreq;
   }
 
   /**
-   * 自相关法检测基频
+   * 归一化自相关法检测基频
+   *
+   * 对每个滞后量分别去均值并按两段能量归一化，得到取值 [-1, 1] 的
+   * 相关系数，避免长滞后因参与求和样本少而虚高；随后选取第一个
+   * 超过阈值的显著峰，从源头避免把基频周期的整数倍当成周期。
    */
   autocorrelation(audioData, sampleRate) {
     const minPeriod = Math.floor(sampleRate / 2000); // 最高频率 2000Hz
-    const maxPeriod = Math.floor(sampleRate / 50);   // 最低频率 50Hz
+    const maxPeriodCandidate = Math.floor(sampleRate / 50);   // 最低频率 50Hz
     const dataLength = Math.min(audioData.length, sampleRate); // 最多分析1秒
-    
-    let maxCorr = 0;
-    let bestPeriod = minPeriod;
-    
-    for (let period = minPeriod; period < maxPeriod && period < dataLength / 2; period++) {
-      let corr = 0;
-      let count = 0;
-      
-      for (let i = 0; i < dataLength - period; i++) {
-        corr += audioData[i] * audioData[i + period];
-        count++;
+
+    // 至少要容纳两个最短周期；滞后量不能超过数据长度的一半
+    const maxPeriod = Math.min(maxPeriodCandidate, Math.floor(dataLength / 2));
+    if (dataLength < 2 * minPeriod || maxPeriod <= minPeriod) {
+      return 0;
+    }
+
+    // 前缀和，用于 O(1) 计算各滞后段的均值
+    const prefixSum = new Float64Array(dataLength + 1);
+    for (let i = 0; i < dataLength; i++) {
+      prefixSum[i + 1] = prefixSum[i] + audioData[i];
+    }
+
+    const nacf = new Float64Array(maxPeriod);
+    let globalMax = 0;
+
+    for (let period = minPeriod; period < maxPeriod; period++) {
+      const overlap = dataLength - period;
+
+      // 去掉两段各自的直流分量后再做相关
+      const mean1 = (prefixSum[overlap] - prefixSum[0]) / overlap;
+      const mean2 = (prefixSum[dataLength] - prefixSum[period]) / overlap;
+      let cov = 0;
+      for (let i = 0; i < overlap; i++) {
+        cov += (audioData[i] - mean1) * (audioData[i + period] - mean2);
       }
-      
-      corr /= count;
-      
-      if (corr > maxCorr) {
-        maxCorr = corr;
+
+      let var1 = 0;
+      let var2 = 0;
+      for (let i = 0; i < overlap; i++) {
+        const d1 = audioData[i] - mean1;
+        const d2 = audioData[i + period] - mean2;
+        var1 += d1 * d1;
+        var2 += d2 * d2;
+      }
+
+      const denom = Math.sqrt(var1 * var2);
+      const corr = denom > 0 ? cov / denom : 0;
+      nacf[period] = corr;
+      if (corr > globalMax) globalMax = corr;
+    }
+
+    // 取第一个显著峰：谐波信号在基频周期的整数倍处都会出现强相关，
+    // 最短的那个周期才对应真正的基频
+    const threshold = Math.min(0.85, 0.97 * globalMax);
+    for (let period = minPeriod + 1; period < maxPeriod - 1; period++) {
+      if (
+        nacf[period] >= threshold &&
+        nacf[period] >= nacf[period - 1] &&
+        nacf[period] > nacf[period + 1]
+      ) {
+        // 抛物线插值获得亚采样级精度的周期
+        const y0 = nacf[period - 1];
+        const y1 = nacf[period];
+        const y2 = nacf[period + 1];
+        const denom = y0 - 2 * y1 + y2;
+        const shift = denom !== 0 ? 0.5 * (y0 - y2) / denom : 0;
+        const refinedPeriod = period + Math.max(-1, Math.min(1, shift));
+        return sampleRate / refinedPeriod;
+      }
+    }
+
+    // 兜底：找不到显著峰时返回全局最大滞后
+    let bestPeriod = minPeriod;
+    let bestCorr = -Infinity;
+    for (let period = minPeriod; period < maxPeriod; period++) {
+      if (nacf[period] > bestCorr) {
+        bestCorr = nacf[period];
         bestPeriod = period;
       }
     }
-    
     return sampleRate / bestPeriod;
   }
 
@@ -211,7 +289,7 @@ export class AudioAnalyzer {
   findDominantPeak(frequencies, magnitudes) {
     let maxMag = 0;
     let peakFreq = 100;
-    
+
     // 在合理的基频范围内寻找最大峰值 (古琴基频通常在 60-500Hz)
     for (let i = 0; i < frequencies.length; i++) {
       if (frequencies[i] >= 50 && frequencies[i] <= 1000) {
@@ -221,39 +299,61 @@ export class AudioAnalyzer {
         }
       }
     }
-    
+
     return peakFreq;
   }
 
   /**
-   * 验证基频 - 检查是否有更低的基频
+   * 倍频/半频校验
+   *
+   * 基频候选位置若几乎没有能量（低于全频段最大能量的 0.5%），
+   * 而其 2 倍频处能量显著（至少高一个数量级），说明自相关把
+   * 2 倍周期当成了周期，即结果低了一个八度——向上修正。
+   * 循环检查可同时应对低两个八度的极端误检。
    */
-  verifyFundamental(freq, frequencies, magnitudes) {
-    // 检查 freq/2, freq/3 等是否也有显著能量
-    const possibleFundamentals = [freq, freq / 2, freq / 3];
-    
-    for (const possibleFreq of possibleFundamentals) {
-      if (possibleFreq < 50) continue;
-      
-      // 检查该频率附近是否有能量
-      const tolerance = possibleFreq * 0.05; // 5% 容差
-      let hasEnergy = false;
-      
+  correctOctaveError(freq, frequencies, magnitudes) {
+    if (!frequencies.length) return freq;
+
+    const globalMax = Math.max(...magnitudes);
+    if (globalMax <= 0) return freq;
+
+    const energyAt = (targetFreq) => {
+      // 容差取 3% 与一个频率分辨率中的较大者
+      let binWidth = Infinity;
+      for (let i = 1; i < frequencies.length; i++) {
+        binWidth = Math.min(binWidth, frequencies[i] - frequencies[i - 1]);
+      }
+      const tolerance = Math.max(targetFreq * 0.03, binWidth);
+      let energy = 0;
       for (let i = 0; i < frequencies.length; i++) {
-        if (Math.abs(frequencies[i] - possibleFreq) < tolerance) {
-          if (magnitudes[i] > 0.1 * Math.max(...magnitudes)) {
-            hasEnergy = true;
-            break;
-          }
+        if (Math.abs(frequencies[i] - targetFreq) <= tolerance) {
+          energy = Math.max(energy, magnitudes[i]);
         }
       }
-      
-      if (hasEnergy && possibleFreq < freq) {
-        return possibleFreq;
+      return energy;
+    };
+
+    let candidate = freq;
+    for (let octave = 0; octave < 2; octave++) {
+      if (candidate * 2 > 1000) break;
+      const selfEnergy = energyAt(candidate);
+      const doubleEnergy = energyAt(candidate * 2);
+      if (
+        selfEnergy < 0.005 * globalMax &&
+        doubleEnergy > 0.01 * globalMax &&
+        doubleEnergy > 10 * selfEnergy
+      ) {
+        logger.info('检测到低八度误检，基频上移一个八度', {
+          from: candidate,
+          to: candidate * 2
+        });
+        candidate *= 2;
+      } else {
+        break;
       }
     }
-    
-    return freq;
+
+    return candidate;
   }
 
   /**
